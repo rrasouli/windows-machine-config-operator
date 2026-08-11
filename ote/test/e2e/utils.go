@@ -26,18 +26,28 @@ import (
 )
 
 var (
-	mcoNamespace     = "openshift-machine-api"
-	capiNamespace    = "openshift-cluster-api"
-	wmcoNamespace    = "openshift-windows-machine-config-operator"
-	wmcoDeployment   = "deployment.apps/windows-machine-config-operator"
-	iaasPlatform     string
-	windowsNodeLabel = "kubernetes.io/os=windows"
-	linuxNodeLabel   = "kubernetes.io/os=linux"
+	mcoNamespace       = "openshift-machine-api"
+	capiNamespace      = "openshift-cluster-api"
+	wmcoNamespace      = "openshift-windows-machine-config-operator"
+	wmcoDeployment     = "deployment.apps/windows-machine-config-operator"
+	wmcoDeploymentName = "windows-machine-config-operator"
+	iaasPlatform       string
+	windowsNodeLabel   = "kubernetes.io/os=windows"
+	linuxNodeLabel     = "kubernetes.io/os=linux"
 
 	machineLabel      = "machine.openshift.io/os-id=Windows"
 	windowsDebugImage = "mcr.microsoft.com/powershell:lts-nanoserver-ltsc2022"
 	linuxDebugImage   = "registry.access.redhat.com/ubi9/ubi:latest"
 )
+
+// Service represents a Windows service entry from the WICD windows-services ConfigMap.
+type Service struct {
+	Name         string   `json:"name"`
+	Path         string   `json:"path"`
+	Bootstrap    bool     `json:"bootstrap"`
+	Priority     int      `json:"priority"`
+	Dependencies []string `json:"dependencies,omitempty"`
+}
 
 // checkVersionAnnotationReady returns true if the WMCO version annotation is set on the node.
 func checkVersionAnnotationReady(oc *exutil.CLI, windowsNodeName string) (bool, error) {
@@ -178,6 +188,7 @@ func getContainerdVersion(oc *exutil.CLI, nodeIP string) string {
 	return "v" + parts[1]
 }
 
+// getValueFromText searches line-delimited text for a key and returns the value after the key.
 func getValueFromText(body []byte, searchVal string) string {
 	lines := strings.Split(string(body), "\n")
 	for _, field := range lines {
@@ -318,6 +329,7 @@ func isBYOH(oc *exutil.CLI, nodeName string) bool {
 	return err == nil && strings.TrimSpace(byohLabel) == "true"
 }
 
+// getNodeNameFromIP resolves a node's hostname from its InternalIP address using a Go template query.
 func getNodeNameFromIP(oc *exutil.CLI, nodeIP string) string {
 	goTpl := fmt.Sprintf(
 		`{{range .items}}{{$name := .metadata.name}}{{range .status.addresses}}`+
@@ -331,6 +343,7 @@ func getNodeNameFromIP(oc *exutil.CLI, nodeIP string) string {
 	return nodeName
 }
 
+// waitWindowsNodesReady polls until the expected number of Windows nodes report Ready status.
 func waitWindowsNodesReady(oc *exutil.CLI, expectedCount int, timeout time.Duration) {
 	pollErr := wait.Poll(10*time.Second, timeout, func() (bool, error) {
 		output, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
@@ -390,6 +403,7 @@ func getServiceCommand(servicesJSON, serviceName string) string {
 	return ""
 }
 
+// waitWindowsNodeReady polls until a specific Windows node reports Ready status.
 func waitWindowsNodeReady(oc *exutil.CLI, nodeName string, timeout time.Duration) {
 	pollErr := wait.Poll(10*time.Second, timeout, func() (bool, error) {
 		status, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
@@ -404,6 +418,10 @@ func waitWindowsNodeReady(oc *exutil.CLI, nodeName string, timeout time.Duration
 	compat_otp.AssertWaitPollNoErr(pollErr, fmt.Sprintf("timed out waiting for node %s to be Ready after %v", nodeName, timeout))
 }
 
+// runDebugNodePS runs a PowerShell command on a Windows node via oc debug node.
+// Suitable for host filesystem operations (e.g. Test-Path, Get-Content on C:\host\...) but
+// NOT for Windows service queries -- oc debug does not create a HostProcess container, so
+// Get-Service, sc.exe, etc. only see the container's SCM. Use runHostProcessPS for those.
 func runDebugNodePS(oc *exutil.CLI, nodeName, image, psCommand string) (string, error) {
 	output, err := oc.AsAdmin().WithoutNamespace().Run("debug").Args(
 		"node/"+nodeName,
@@ -426,6 +444,73 @@ func runDebugNodePS(oc *exutil.CLI, nodeName, image, psCommand string) (string, 
 	return strings.Join(cleaned, "\n"), nil
 }
 
+// runHostProcessPS runs a PowerShell command on a Windows node using a HostProcess container.
+// Unlike runDebugNodePS, this creates an explicit HostProcess pod with hostProcess=true and
+// runAsUserName="NT AUTHORITY\SYSTEM", giving the process full access to the host's Service
+// Control Manager, processes, and registry. Required for Get-Service, sc.exe, Stop-Service,
+// and any other command that needs to interact with host-level Windows services.
+// The pod is created via oc run --overrides, polled until completion, and cleaned up on exit.
+func runHostProcessPS(oc *exutil.CLI, nodeName, image, psCommand string) (string, error) {
+	b := make([]byte, 4)
+	rand.Read(b)
+	suffix := fmt.Sprintf("%x", b)
+	nodeSafe := strings.ReplaceAll(nodeName, ".", "-")
+	if len(nodeSafe) > 20 {
+		nodeSafe = nodeSafe[:20]
+	}
+	podName := fmt.Sprintf("hpc-%s-%s", nodeSafe, suffix)
+
+	overrides := fmt.Sprintf(
+		`{"spec":{"hostNetwork":true,"nodeSelector":{"kubernetes.io/hostname":"%s"},`+
+			`"securityContext":{"windowsOptions":{"hostProcess":true,"runAsUserName":"NT AUTHORITY\\SYSTEM"}}}}`,
+		nodeName)
+
+	_, err := oc.AsAdmin().WithoutNamespace().Run("run").Args(
+		podName,
+		"-n", wmcoNamespace,
+		"--image="+image,
+		"--restart=Never",
+		"--overrides="+overrides,
+		"--command", "--",
+		"pwsh", "-Command", psCommand,
+	).Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to create HostProcess pod on %s: %w", nodeName, err)
+	}
+
+	defer oc.AsAdmin().WithoutNamespace().Run("delete").Args(
+		"pod", podName, "-n", wmcoNamespace, "--ignore-not-found", "--wait=false").Execute()
+
+	pollErr := wait.Poll(5*time.Second, 3*time.Minute, func() (bool, error) {
+		phase, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
+			"pod", podName, "-n", wmcoNamespace, "-o=jsonpath={.status.phase}").Output()
+		if err != nil {
+			return false, nil
+		}
+		p := strings.TrimSpace(phase)
+		return p == "Succeeded" || p == "Failed", nil
+	})
+	if pollErr != nil {
+		return "", fmt.Errorf("HostProcess pod %s did not complete: %w", podName, pollErr)
+	}
+
+	phase, _ := oc.AsAdmin().WithoutNamespace().Run("get").Args(
+		"pod", podName, "-n", wmcoNamespace, "-o=jsonpath={.status.phase}").Output()
+
+	output, logErr := oc.AsAdmin().WithoutNamespace().Run("logs").Args(
+		podName, "-n", wmcoNamespace).Output()
+	if logErr != nil {
+		return "", fmt.Errorf("failed to get HostProcess pod logs: %w", logErr)
+	}
+
+	if strings.TrimSpace(phase) == "Failed" {
+		return "", fmt.Errorf("HostProcess command failed on %s: %s", nodeName, output)
+	}
+
+	return strings.TrimSpace(output), nil
+}
+
+// createResourceFromString writes a YAML manifest to a temp file and applies it via oc apply.
 func createResourceFromString(oc *exutil.CLI, namespace, manifest string) error {
 	tempFile, err := os.CreateTemp("", "manifest-*.yaml")
 	if err != nil {
@@ -452,6 +537,7 @@ func createResourceFromString(oc *exutil.CLI, namespace, manifest string) error 
 	return nil
 }
 
+// getRandomString returns a cryptographically random base64 string of the given length.
 func getRandomString(length int) string {
 	o.Expect(length).To(o.BeNumerically(">", 0), "getRandomString requires a positive length")
 	buff := make([]byte, length)
@@ -461,6 +547,7 @@ func getRandomString(length int) string {
 	return str[:length]
 }
 
+// createProject creates a namespace if it does not already exist and sets privileged SCC.
 func createProject(oc *exutil.CLI, namespace string) {
 	exists := oc.AsAdmin().WithoutNamespace().Run("get").Args("namespace", namespace).Execute()
 	if exists == nil {
@@ -472,10 +559,14 @@ func createProject(oc *exutil.CLI, namespace string) {
 	o.Expect(err).NotTo(o.HaveOccurred())
 }
 
+// deleteProject deletes the given namespace.
 func deleteProject(oc *exutil.CLI, namespace string) {
 	oc.DeleteSpecifiedNamespaceAsAdmin(namespace)
 }
 
+// generateWindowsWebServerYAML returns a YAML manifest for a Windows web server Deployment
+// (and optionally a LoadBalancer Service). Used to deploy Windows workloads for connectivity
+// and scaling tests.
 func generateWindowsWebServerYAML(name, namespace, image string, replicas int, includeService bool, resourceLimits, runtimeClassName string) string {
 	var sb strings.Builder
 	if includeService {
@@ -554,6 +645,7 @@ spec:
 	return sb.String()
 }
 
+// generateHPAYAML returns a YAML manifest for a HorizontalPodAutoscaler targeting a Deployment.
 func generateHPAYAML(name, namespace, deploymentName string, minReplicas, maxReplicas, stabilizationWindow int, metricName, averageValue string) string {
 	yaml := fmt.Sprintf(`apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -584,6 +676,7 @@ spec:
 	return yaml
 }
 
+// generateRuntimeClassYAML returns a YAML manifest for a Windows RuntimeClass with node selector and tolerations.
 func generateRuntimeClassYAML(name, buildID string) string {
 	return fmt.Sprintf(`apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -601,6 +694,8 @@ scheduling:
 `, name, buildID)
 }
 
+// waitForDeploymentReady polls until all replicas of a Deployment are ready, or returns an error
+// on timeout, ImagePullBackOff, or CrashLoopBackOff. Logs diagnostic info on failure.
 func waitForDeploymentReady(oc *exutil.CLI, deploymentName, namespace string, timeout time.Duration) error {
 	var lastPodStatus string
 	imagePullBackOffCount := 0
@@ -677,6 +772,7 @@ func waitForDeploymentReady(oc *exutil.CLI, deploymentName, namespace string, ti
 	return nil
 }
 
+// checkWorkloadCreated returns true if the Deployment has exactly the expected number of ready replicas.
 func checkWorkloadCreated(oc *exutil.CLI, name, namespace string, replicaCount int) bool {
 	readyReplicas, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
 		"deployment", name, "-n", namespace, "-o=jsonpath={.status.readyReplicas}",
@@ -703,6 +799,8 @@ func checkWorkloadCreated(oc *exutil.CLI, name, namespace string, replicaCount i
 	return numberOfWorkloads == replicaCount
 }
 
+// scaleDeployment scales a Deployment to the given replica count and waits until the desired
+// number of ready replicas is reached (up to 30 minutes).
 func scaleDeployment(oc *exutil.CLI, deploymentName string, replicas int, namespace string) error {
 	_, err := oc.AsAdmin().WithoutNamespace().Run("scale").
 		Args("--replicas="+strconv.Itoa(replicas), "deployment", deploymentName, "-n", namespace).Output()
@@ -720,6 +818,7 @@ func scaleDeployment(oc *exutil.CLI, deploymentName string, replicas int, namesp
 	return nil
 }
 
+// getExternalIP polls for the LoadBalancer external IP (or hostname on AWS) assigned to a Service.
 func getExternalIP(iaasPlatform string, oc *exutil.CLI, deploymentName string, namespace string) (string, error) {
 	var cmdArgs []string
 	if iaasPlatform == "azure" || iaasPlatform == "gcp" {
@@ -751,16 +850,20 @@ func getExternalIP(iaasPlatform string, oc *exutil.CLI, deploymentName string, n
 	return extIP, nil
 }
 
+// haveMetricsServer returns true if the metrics API service (v1beta1.metrics.k8s.io) is available.
 func haveMetricsServer(oc *exutil.CLI) bool {
 	output, err := oc.AsAdmin().WithoutNamespace().Run("get").Args("apiservice", "v1beta1.metrics.k8s.io").Output()
 	return err == nil && strings.Contains(output, "True")
 }
 
+// getWindowsBuildID returns the Windows build number label from a node (e.g. "10.0.20348").
 func getWindowsBuildID(oc *exutil.CLI, nodeID string) (string, error) {
 	build, err := oc.AsAdmin().WithoutNamespace().Run("get").Args("node", nodeID, "-o=jsonpath={.metadata.labels.node\\.kubernetes\\.io\\/windows-build}").Output()
 	return build, err
 }
 
+// checkConnectivity repeatedly curls the given IP on port 80 and verifies the Windows web server
+// response. Runs until the context is cancelled. Used with runInBackground for load-testing.
 func checkConnectivity(ctx context.Context, IP string, delay int) error {
 	url := "http://" + net.JoinHostPort(IP, "80")
 	timeout := strconv.Itoa(delay)
@@ -786,6 +889,7 @@ func checkConnectivity(ctx context.Context, IP string, delay int) error {
 	}
 }
 
+// generateLinuxWebServerYAML returns a YAML manifest for a Linux web server Deployment using python http.server.
 func generateLinuxWebServerYAML(name, namespace, image string, replicas int) string {
 	return fmt.Sprintf(`apiVersion: apps/v1
 kind: Deployment
@@ -822,6 +926,7 @@ spec:
 `, name, name, name, replicas, name, name, image)
 }
 
+// getWorkloadsNames returns the pod names for all pods belonging to the given Deployment, sorted by host IP.
 func getWorkloadsNames(oc *exutil.CLI, deploymentName string, namespace string) ([]string, error) {
 	workloads, err := oc.AsAdmin().WithoutNamespace().Run("get").Args("pod", "--selector", "app="+deploymentName, "--sort-by=.status.hostIP", "-o=jsonpath={.items[*].metadata.name}", "-n", namespace).Output()
 	if err != nil {
@@ -834,6 +939,7 @@ func getWorkloadsNames(oc *exutil.CLI, deploymentName string, namespace string) 
 	return pods, nil
 }
 
+// getWorkloadsIP returns the pod IPs for all pods belonging to the given Deployment, sorted by host IP.
 func getWorkloadsIP(oc *exutil.CLI, deploymentName string, namespace string) ([]string, error) {
 	workloads, err := oc.AsAdmin().WithoutNamespace().Run("get").Args("pod", "--selector", "app="+deploymentName, "--sort-by=.status.hostIP", "-o=jsonpath={.items[*].status.podIP}", "-n", namespace).Output()
 	if err != nil {
@@ -846,6 +952,7 @@ func getWorkloadsIP(oc *exutil.CLI, deploymentName string, namespace string) ([]
 	return ips, nil
 }
 
+// buildInvokeWebRequestCommand returns a PowerShell command that fetches a URL and decodes the response as UTF-8.
 func buildInvokeWebRequestCommand(url string) string {
 	return fmt.Sprintf(
 		"$r = Invoke-WebRequest -Uri %s -UseBasicParsing -ErrorAction SilentlyContinue; "+
@@ -853,6 +960,8 @@ func buildInvokeWebRequestCommand(url string) string {
 		url)
 }
 
+// runInBackground launches a check function (e.g. checkConnectivity) in a goroutine and returns
+// a channel that receives the error when the function exits. Cancels the context on error.
 func runInBackground(ctx context.Context, cancel context.CancelFunc, check func(context.Context, string, int) error, val string, delay int) <-chan error {
 	errCh := make(chan error, 1)
 	go func() {
@@ -865,4 +974,102 @@ func runInBackground(ctx context.Context, cancel context.CancelFunc, check func(
 		errCh <- err
 	}()
 	return errCh
+}
+
+// getLatestServicesCMName returns the name of the last windows-services-* ConfigMap found in the
+// WMCO namespace. The iteration order matches OTP's popItemFromList (last match wins).
+func getLatestServicesCMName(oc *exutil.CLI) (string, error) {
+	cmNames, err := oc.AsAdmin().WithoutNamespace().Run("get").Args(
+		"configmap", "-n", wmcoNamespace,
+		"-o=jsonpath={.items[*].metadata.name}").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to list ConfigMaps: %w", err)
+	}
+	var latestCM string
+	for _, name := range strings.Fields(cmNames) {
+		if strings.HasPrefix(name, "windows-services-") {
+			latestCM = name
+		}
+	}
+	if latestCM == "" {
+		return "", fmt.Errorf("no windows-services ConfigMap found in %s", wmcoNamespace)
+	}
+	return latestCM, nil
+}
+
+// waitForServicesCM polls until getLatestServicesCMName returns the expected ConfigMap name.
+// Used after deleting/recreating CMs to verify WMCO reconciles the correct version.
+func waitForServicesCM(oc *exutil.CLI, expectedCMName string, timeout time.Duration) {
+	pollErr := wait.Poll(10*time.Second, timeout, func() (bool, error) {
+		cmName, err := getLatestServicesCMName(oc)
+		if err != nil || cmName == "" {
+			return false, nil
+		}
+		if cmName == expectedCMName {
+			return true, nil
+		}
+		e2e.Logf("ConfigMap %v does not match expected %v", cmName, expectedCMName)
+		return false, nil
+	})
+	compat_otp.AssertWaitPollNoErr(pollErr, fmt.Sprintf("Expected windows-services ConfigMap %s not found after %v", expectedCMName, timeout))
+}
+
+// generateWICDConfigMapYAML returns a YAML manifest for a WICD windows-services ConfigMap.
+// Ported from OTP generators.go GenerateWICDConfigMap.
+func generateWICDConfigMapYAML(name, servicesJSON string) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: %s
+  namespace: openshift-windows-machine-config-operator
+data:
+  services: '%s'
+`, name, servicesJSON)
+}
+
+// checkWindowsServiceRunning returns true if the named Windows service is in Running state on the
+// given node. Uses a HostProcess pod to query the host's Service Control Manager.
+func checkWindowsServiceRunning(oc *exutil.CLI, nodeName, image, serviceName string) (bool, error) {
+	cmd := fmt.Sprintf("Get-Service '%s' | Select-Object -ExpandProperty Status", serviceName)
+	output, err := runHostProcessPS(oc, nodeName, image, cmd)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(output) == "Running", nil
+}
+
+// getServiceBinPath returns the PathName (binary path) of a Windows service via WMI CIM query.
+// Uses a HostProcess pod to access the host's Service Control Manager.
+func getServiceBinPath(oc *exutil.CLI, nodeName, image, serviceName string) (string, error) {
+	cmd := fmt.Sprintf("Get-CimInstance -ClassName Win32_Service | Where-Object { $_.Name -eq '%s' } | Select-Object -ExpandProperty PathName", serviceName)
+	output, err := runHostProcessPS(oc, nodeName, image, cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
+}
+
+// setServiceBinPath modifies the binary path of a Windows service using sc.exe config.
+// Uses a HostProcess pod to access the host's Service Control Manager.
+func setServiceBinPath(oc *exutil.CLI, nodeName, image, serviceName, binPath string) error {
+	cmd := fmt.Sprintf(`sc.exe config %s binPath= "%s"`, serviceName, binPath)
+	output, err := runHostProcessPS(oc, nodeName, image, cmd)
+	if err != nil {
+		return fmt.Errorf("sc.exe config failed: %w (output: %s)", err, output)
+	}
+	if !strings.Contains(output, "SUCCESS") {
+		return fmt.Errorf("sc.exe config did not report SUCCESS: %s", output)
+	}
+	return nil
+}
+
+// stopWindowsService stops a Windows service and returns its status after the stop attempt.
+// Uses a HostProcess pod to access the host's Service Control Manager.
+func stopWindowsService(oc *exutil.CLI, nodeName, image, serviceName string) (string, error) {
+	cmd := fmt.Sprintf("Stop-Service '%s' -Force -ErrorAction SilentlyContinue; (Get-Service '%s').Status", serviceName, serviceName)
+	output, err := runHostProcessPS(oc, nodeName, image, cmd)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(output), nil
 }
